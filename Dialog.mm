@@ -6,6 +6,7 @@
 
 @interface TMDWindowController : NSObject <NSWindowDelegate>
 {
+	CFMessagePortRef clientPort; // the tool's port, watched so the window closes if the tool dies
 	NSWindow* window;
 	BOOL isModal;
 	BOOL center;
@@ -19,6 +20,7 @@
 + (TMDWindowController*)windowControllerForToken:(NSInteger)token;
 + (NSArray*)nibDescriptions;
 - (void)cleanupAndRelease:(id)sender;
+- (void)connectionDidDie:(NSNotification*)aNotification;
 
 // return unique ID for this TMDWindowController instance
 - (NSInteger)token;
@@ -28,6 +30,18 @@
 - (void)wakeClient;
 - (NSMutableDictionary*)returnResult;
 @end
+
+// Name of the port owned by the tool whose request is being handled, set by Dialog while it dispatches
+static NSString* sRequestClientPortName = nil;
+
+// Remote ports being watched for the death of their tool, keyed by port address
+static NSMutableDictionary<NSValue*, TMDWindowController*>* sClientPortWatchers = nil;
+
+static void TMDClientPortDidInvalidate (CFMessagePortRef port, void* info)
+{
+	if(TMDWindowController* controller = sClientPortWatchers[[NSValue valueWithPointer:port]])
+		[controller connectionDidDie:nil];
+}
 
 @implementation TMDWindowController
 
@@ -142,11 +156,37 @@ static NSUInteger sNextWindowControllerToken = 1;
 	}
 }
 
+// Close the window if the tool that asked for it goes away: a remote CFMessagePort is invalidated when its owner dies
+- (void)watchClientPortNamed:(NSString*)name
+{
+	if(!name || clientPort)
+		return;
+	clientPort = CFMessagePortCreateRemote(kCFAllocatorDefault, (__bridge CFStringRef)name);
+	if(!clientPort)
+		return;
+	if(!sClientPortWatchers)
+		sClientPortWatchers = [NSMutableDictionary dictionary];
+	sClientPortWatchers[[NSValue valueWithPointer:clientPort]] = self;
+	CFMessagePortSetInvalidationCallBack(clientPort, &TMDClientPortDidInvalidate);
+}
+
+- (void)stopWatchingClientPort
+{
+	if(!clientPort)
+		return;
+	CFMessagePortSetInvalidationCallBack(clientPort, NULL);
+	[sClientPortWatchers removeObjectForKey:[NSValue valueWithPointer:clientPort]];
+	CFRelease(clientPort);
+	clientPort = NULL;
+}
+
 - (void)cleanupAndRelease:(id)sender
 {
 	if(didCleanup)
 		return;
 	didCleanup = YES;
+
+	[self stopWatchingClientPort];
 
 	[sWindowControllers removeObject:self];
 
@@ -313,7 +353,7 @@ static NSUInteger sNextWindowControllerToken = 1;
 - (NSDictionary*)instantiateNib:(NSNib*)aNib
 {
 	if(!async)
-		[NSNotificationCenter.defaultCenter addObserver:self selector:@selector(connectionDidDie:) name:NSPortDidBecomeInvalidNotification object:nil];
+		[self watchClientPortNamed:sRequestClientPortName];
 
 	BOOL didInstantiate = NO;
 	NSMutableArray* objects;
@@ -421,9 +461,50 @@ static NSUInteger sNextWindowControllerToken = 1;
 @end
 
 @interface Dialog : NSObject <TextMateDialogServerProtocol>
-@property (nonatomic) NSConnection* connection;
+{
+	CFMessagePortRef _port;
+}
 - (id)initWithPlugInController:(id <TMPlugInController>)aController;
+- (NSDictionary*)handleRequest:(NSDictionary*)request;
 @end
+
+// Only property list values can travel back to the tool; the nib parameters carry the controller object as well
+static id TMDPropertyListCopy (id value)
+{
+	if([value isKindOfClass:[NSDictionary class]])
+	{
+		NSMutableDictionary* res = [NSMutableDictionary dictionary];
+		for(id key in value)
+		{
+			if(id copy = [key isKindOfClass:[NSString class]] ? TMDPropertyListCopy(value[key]) : nil)
+				res[key] = copy;
+		}
+		return res;
+	}
+	else if([value isKindOfClass:[NSArray class]])
+	{
+		NSMutableArray* res = [NSMutableArray array];
+		for(id item in value)
+		{
+			if(id copy = TMDPropertyListCopy(item))
+				[res addObject:copy];
+		}
+		return res;
+	}
+	else if([value isKindOfClass:[NSString class]] || [value isKindOfClass:[NSNumber class]] || [value isKindOfClass:[NSDate class]] || [value isKindOfClass:[NSData class]])
+	{
+		return value;
+	}
+	return nil;
+}
+
+static CFDataRef DialogServerCallback (CFMessagePortRef port, SInt32 messageID, CFDataRef data, void* info)
+{
+	id request = data ? [NSPropertyListSerialization propertyListWithData:(__bridge NSData*)data options:NSPropertyListMutableContainers format:nil error:nil] : nil;
+	NSDictionary* reply = [request isKindOfClass:[NSDictionary class]] ? [(__bridge Dialog*)info handleRequest:request] : nil;
+	NSData* replyData = reply ? [NSPropertyListSerialization dataWithPropertyList:reply format:NSPropertyListBinaryFormat_v1_0 options:0 error:nil] : nil;
+	return replyData ? (CFDataRef)CFBridgingRetain(replyData) : NULL;
+}
 
 @implementation Dialog
 - (id)initWithPlugInController:(id <TMPlugInController>)aController
@@ -431,12 +512,19 @@ static NSUInteger sNextWindowControllerToken = 1;
 	NSApp = NSApplication.sharedApplication;
 	if(self = [super init])
 	{
-		_connection = [NSConnection new];
-		[_connection setRootObject:self];
-
 		NSString* portName = [NSString stringWithFormat:@"%@.%d", @"com.macromates.dialog_1", getpid()];
-		if([_connection registerName:portName] == NO)
+		CFMessagePortContext context = { 0, (__bridge void*)self, NULL, NULL, NULL };
+		_port = CFMessagePortCreateLocal(kCFAllocatorDefault, (__bridge CFStringRef)portName, &DialogServerCallback, &context, NULL);
+		if(_port)
+		{
+			CFRunLoopSourceRef source = CFMessagePortCreateRunLoopSource(kCFAllocatorDefault, _port, 0);
+			CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
+			CFRelease(source);
+		}
+		else
+		{
 			NSLog(@"couldn't setup port: %@", portName), NSBeep();
+		}
 		setenv("DIALOG_1_PORT_NAME", [portName UTF8String], 1);
 
 		if(NSString* path = [[NSBundle bundleForClass:[self class]] pathForResource:@"tm_dialog" ofType:nil])
@@ -448,6 +536,41 @@ static NSUInteger sNextWindowControllerToken = 1;
 - (NSInteger)textMateDialogServerProtocolVersion
 {
 	return TextMateDialogServerProtocolVersion;
+}
+
+// One request per protocol call, see TMDialogServerProxy in tm_dialog.mm for the other side
+- (NSDictionary*)handleRequest:(NSDictionary*)request
+{
+	NSString* method = [request[@"method"] isKindOfClass:[NSString class]] ? request[@"method"] : @"";
+	NSDictionary* a   = [request[@"arguments"] isKindOfClass:[NSDictionary class]] ? request[@"arguments"] : @{ };
+
+	NSString* previousClient = sRequestClientPortName;
+	sRequestClientPortName = [request[@"client"] isKindOfClass:[NSString class]] ? request[@"client"] : nil;
+
+	id result = nil;
+	if([method isEqualToString:@"version"])
+		result = @([self textMateDialogServerProtocolVersion]);
+	else if([method isEqualToString:@"showNib"])
+		result = [self showNib:a[@"nibPath"] withParameters:(a[@"parameters"] ?: [NSMutableDictionary dictionary]) andInitialValues:a[@"initialValues"] dynamicClasses:a[@"dynamicClasses"] modal:[a[@"modal"] boolValue] center:[a[@"center"] boolValue] async:[a[@"async"] boolValue]];
+	else if([method isEqualToString:@"listNibTokens"])
+		result = [self listNibTokens];
+	else if([method isEqualToString:@"updateNib"])
+		result = [self updateNib:a[@"token"] withParameters:a[@"parameters"]];
+	else if([method isEqualToString:@"closeNib"])
+		result = [self closeNib:a[@"token"]];
+	else if([method isEqualToString:@"retrieveNibResults"])
+		result = [self retrieveNibResults:a[@"token"]];
+	else if([method isEqualToString:@"showAlertForPath"])
+		result = [self showAlertForPath:a[@"filePath"] withParameters:a[@"parameters"] modal:[a[@"modal"] boolValue]];
+	else if([method isEqualToString:@"showMenuWithOptions"])
+		result = [self showMenuWithOptions:a[@"options"]];
+	else
+		NSLog(@"%s unknown request: %@", sel_getName(_cmd), method);
+
+	sRequestClientPortName = previousClient;
+
+	id plist = TMDPropertyListCopy(result);
+	return plist ? @{ @"result": plist } : @{ };
 }
 
 // filePath: find the window with this path, and create a sheet on it. If we can't find one, may go app-modal.
