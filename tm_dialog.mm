@@ -10,12 +10,127 @@
 #import <string>
 #import <sys/stat.h>
 
+static char const* const AppName    = "tm_dialog";
+static char const* const AppVersion = "1.2";
+
 #import "TMDSemaphore.h"
 #include "TMDSemaphore.mm"  // TODO we should really export this from the plugin instead and link against the plugin
 #import "Dialog.h"
 
-static char const* const AppName    = "tm_dialog";
-static char const* const AppVersion = "1.1";
+// The plug-in answers on a CFMessagePort (see Dialog.mm). Every protocol call becomes one request
+// { method, arguments, client } and the reply carries { result }. `client` names a port this tool
+// owns; its disappearance is how the plug-in notices that the tool died while a window was up.
+static CFDataRef TMDialogClientPortCallback (CFMessagePortRef port, SInt32 messageID, CFDataRef data, void* info)
+{
+	return NULL;
+}
+
+@interface TMDialogServerProxy : NSObject <TextMateDialogServerProtocol>
+- (instancetype)initWithPortName:(NSString*)portName;
+@end
+
+@implementation TMDialogServerProxy
+{
+	CFMessagePortRef _server;
+	CFMessagePortRef _client;
+	NSString* _clientName;
+}
+
+- (instancetype)initWithPortName:(NSString*)portName
+{
+	if(self = [super init])
+	{
+		_server = CFMessagePortCreateRemote(kCFAllocatorDefault, (__bridge CFStringRef)portName);
+		if(!_server)
+			return nil;
+
+		_clientName = [NSString stringWithFormat:@"%@.client.%d", portName, getpid()];
+		_client = CFMessagePortCreateLocal(kCFAllocatorDefault, (__bridge CFStringRef)_clientName, &TMDialogClientPortCallback, NULL, NULL);
+	}
+	return self;
+}
+
+- (id)send:(NSString*)method arguments:(NSDictionary*)arguments
+{
+	NSMutableDictionary* request = [NSMutableDictionary dictionaryWithObject:method forKey:@"method"];
+	if(_clientName)
+		request[@"client"] = _clientName;
+	if(arguments)
+		request[@"arguments"] = arguments;
+
+	NSData* data = [NSPropertyListSerialization dataWithPropertyList:request format:NSPropertyListBinaryFormat_v1_0 options:0 error:nil];
+	if(!data)
+	{
+		fprintf(stderr, "%s: cannot encode request ‘%s’\n", AppName, method.UTF8String);
+		return nil;
+	}
+
+	// A dialog stays open for as long as the user likes, so wait a day rather than a few seconds
+	CFDataRef replyData = NULL;
+	SInt32 status = CFMessagePortSendRequest(_server, 0, (__bridge CFDataRef)data, 10, 24*60*60, kCFRunLoopDefaultMode, &replyData);
+
+	id reply = nil;
+	if(status == kCFMessagePortSuccess && replyData)
+		reply = [NSPropertyListSerialization propertyListWithData:(__bridge NSData*)replyData options:NSPropertyListMutableContainers format:nil error:nil];
+	if(replyData)
+		CFRelease(replyData);
+
+	return [reply isKindOfClass:[NSDictionary class]] ? reply[@"result"] : nil;
+}
+
+- (NSInteger)textMateDialogServerProtocolVersion
+{
+	return [[self send:@"version" arguments:nil] integerValue];
+}
+
+- (id)showNib:(NSString*)aNibPath withParameters:(id)someParameters andInitialValues:(NSDictionary*)initialValues dynamicClasses:(NSDictionary*)dynamicClasses modal:(BOOL)flag center:(BOOL)shouldCenter async:(BOOL)async
+{
+	NSMutableDictionary* arguments = [NSMutableDictionary dictionaryWithDictionary:@{ @"nibPath": aNibPath ?: @"", @"modal": @(flag), @"center": @(shouldCenter), @"async": @(async) }];
+	if(someParameters)
+		arguments[@"parameters"] = someParameters;
+	if(initialValues)
+		arguments[@"initialValues"] = initialValues;
+	if(dynamicClasses)
+		arguments[@"dynamicClasses"] = dynamicClasses;
+	return [self send:@"showNib" arguments:arguments];
+}
+
+- (id)listNibTokens
+{
+	return [self send:@"listNibTokens" arguments:nil];
+}
+
+- (id)updateNib:(id)token withParameters:(id)someParameters
+{
+	return [self send:@"updateNib" arguments:@{ @"token": token ?: @"", @"parameters": someParameters ?: @{ } }];
+}
+
+- (id)closeNib:(id)token
+{
+	return [self send:@"closeNib" arguments:@{ @"token": token ?: @"" }];
+}
+
+- (id)retrieveNibResults:(id)token
+{
+	return [self send:@"retrieveNibResults" arguments:@{ @"token": token ?: @"" }];
+}
+
+- (id)showAlertForPath:(NSString*)filePath withParameters:(NSDictionary*)parameters modal:(BOOL)modal
+{
+	NSMutableDictionary* arguments = [NSMutableDictionary dictionaryWithObject:@(modal) forKey:@"modal"];
+	if(filePath)
+		arguments[@"filePath"] = filePath;
+	if(parameters)
+		arguments[@"parameters"] = parameters;
+	return [self send:@"showAlertForPath" arguments:arguments];
+}
+
+- (id)showMenuWithOptions:(NSDictionary*)someOptions
+{
+	return [self send:@"showMenuWithOptions" arguments:@{ @"options": someOptions ?: @{ } }];
+}
+@end
+
 
 static char const* csv_escape_string (char const* str)
 {
@@ -141,8 +256,7 @@ BOOL validate_proxy (id* outProxy)
 		if(char const* var = getenv("DIALOG_1_PORT_NAME"))
 			portName = [NSString stringWithUTF8String:var];
 
-		proxy = [NSConnection rootProxyForConnectionWithRegisteredName:portName host:nil];
-		[proxy setProtocolForProxy:@protocol(TextMateDialogServerProtocol)];
+		proxy = [[TMDialogServerProxy alloc] initWithPortName:portName];
 
 		if([proxy textMateDialogServerProtocolVersion] == TextMateDialogServerProtocolVersion)
 		{
